@@ -84,7 +84,11 @@ python3 MozillaFirefoxCacheBugfix.py
 ```
 
 Le bouton `Créer un profil` génère un profil persistant sous `~/.mozilla/firefox` et
-propose de le définir comme profil par défaut.
+propose de le définir comme profil par défaut, puis de transférer immédiatement les
+données utiles depuis l'ancien profil.
+
+La section `Transfert vers un profil propre` permet aussi de choisir manuellement un
+profil source, un profil destination, puis de lancer le transfert.
 
 Diagnostic en ligne de commande :
 

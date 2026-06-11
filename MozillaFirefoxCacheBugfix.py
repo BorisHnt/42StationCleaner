@@ -596,6 +596,8 @@ class App:
             self.profile_label(profile): profile for profile in self.profiles
         }
         self.profile_var = tk.StringVar()
+        self.migrate_from_var = tk.StringVar()
+        self.migrate_to_var = tk.StringVar()
         self.use_cache = tk.BooleanVar(value=True)
         self.use_extensions = tk.BooleanVar(value=False)
         self.summary = tk.StringVar(value="Prêt.")
@@ -639,6 +641,41 @@ class App:
         ttk.Button(options, text="Scanner", command=self.scan).pack(side=tk.LEFT)
         ttk.Button(options, text="Réparer", command=self.repair).pack(side=tk.LEFT, padx=8)
 
+        migration = ttk.LabelFrame(root, text="Transfert vers un profil propre", padding=10)
+        migration.pack(fill=tk.X, padx=10, pady=(0, 8))
+        ttk.Label(migration, text="Depuis :").grid(row=0, column=0, sticky=tk.W)
+        self.migrate_from_box = ttk.Combobox(
+            migration,
+            textvariable=self.migrate_from_var,
+            values=list(self.profile_by_label),
+            state="readonly",
+            width=48,
+        )
+        self.migrate_from_box.grid(row=0, column=1, sticky=tk.EW, padx=(6, 12))
+        ttk.Label(migration, text="Vers :").grid(row=0, column=2, sticky=tk.W)
+        self.migrate_to_box = ttk.Combobox(
+            migration,
+            textvariable=self.migrate_to_var,
+            values=list(self.profile_by_label),
+            state="readonly",
+            width=48,
+        )
+        self.migrate_to_box.grid(row=0, column=3, sticky=tk.EW, padx=(6, 12))
+        ttk.Button(
+            migration,
+            text="Transférer les données",
+            command=self.transfer_profile_data,
+        ).grid(row=0, column=4)
+        migration.columnconfigure(1, weight=1)
+        migration.columnconfigure(3, weight=1)
+        ttk.Label(
+            migration,
+            text=(
+                "Copie mots de passe, cookies, favoris/historique et formulaires. "
+                "Les extensions et préférences ne sont pas copiées."
+            ),
+        ).grid(row=1, column=0, columnspan=5, sticky=tk.W, pady=(8, 0))
+
         ttk.Label(
             root,
             text=(
@@ -661,6 +698,11 @@ class App:
             self.tree.heading(column, text=title)
             self.tree.column(column, width=width, anchor=tk.W)
         self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        labels = list(self.profile_by_label)
+        if labels:
+            self.migrate_from_var.set(labels[0])
+        if len(labels) > 1:
+            self.migrate_to_var.set(labels[1])
         self.scan()
 
     @staticmethod
@@ -671,22 +713,48 @@ class App:
     def selected_profile(self) -> FirefoxProfile | None:
         return self.profile_by_label.get(self.profile_var.get())
 
-    def reload_profiles(self, selected_path: Path | None = None) -> None:
+    def label_for_path(self, path: Path | None) -> str:
+        if path is None:
+            return ""
+        return next(
+            (
+                label
+                for label, profile in self.profile_by_label.items()
+                if profile.path.resolve(strict=False) == path.resolve(strict=False)
+            ),
+            "",
+        )
+
+    def reload_profiles(
+        self,
+        selected_path: Path | None = None,
+        migrate_from: Path | None = None,
+        migrate_to: Path | None = None,
+    ) -> None:
         self.profiles = discover_profiles()
         self.profile_by_label = {
             self.profile_label(profile): profile for profile in self.profiles
         }
-        self.profile_box.configure(values=list(self.profile_by_label))
-        selected_label = next(
-            (
-                label
-                for label, profile in self.profile_by_label.items()
-                if selected_path is not None
-                and profile.path.resolve(strict=False) == selected_path.resolve(strict=False)
-            ),
-            next(iter(self.profile_by_label), ""),
+        labels = list(self.profile_by_label)
+        self.profile_box.configure(values=labels)
+        self.migrate_from_box.configure(values=labels)
+        self.migrate_to_box.configure(values=labels)
+        selected_label = self.label_for_path(selected_path) or next(
+            iter(self.profile_by_label), ""
         )
         self.profile_var.set(selected_label)
+        previous_from = self.migrate_from_var.get()
+        previous_to = self.migrate_to_var.get()
+        from_label = self.label_for_path(migrate_from)
+        if not from_label and previous_from in self.profile_by_label:
+            from_label = previous_from
+        to_label = self.label_for_path(migrate_to)
+        if not to_label and previous_to in self.profile_by_label:
+            to_label = previous_to
+        self.migrate_from_var.set(
+            from_label or next(iter(self.profile_by_label), "")
+        )
+        self.migrate_to_var.set(to_label)
         self.scan()
 
     def create_profile(self) -> None:
@@ -708,18 +776,98 @@ class App:
             "Profil par défaut",
             "Définir ce nouveau profil comme profil Firefox par défaut ?",
         )
+        source_profile = self.selected_profile()
         try:
             result = create_firefox_profile(name, make_default=make_default)
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             messagebox.showerror("Création impossible", str(error))
             return
-        self.reload_profiles(result.profile.path)
-        default_text = " et défini par défaut" if result.made_default else ""
-        messagebox.showinfo(
-            "Profil créé",
-            f"Profil {result.profile.name!r} créé{default_text}.\n\n"
-            f"Répertoire racine : {result.profile.path}",
+        self.reload_profiles(
+            result.profile.path,
+            migrate_from=source_profile.path if source_profile else None,
+            migrate_to=result.profile.path,
         )
+        default_text = " et défini par défaut" if result.made_default else ""
+        details = (
+            f"Profil {result.profile.name!r} créé{default_text}.\n\n"
+            f"Répertoire racine : {result.profile.path}"
+        )
+        if source_profile and messagebox.askyesno(
+            "Profil créé",
+            details
+            + "\n\nTransférer maintenant les mots de passe, cookies, favoris "
+            "et formulaires depuis l'ancien profil ?",
+        ):
+            self.transfer_profile_data(skip_confirmation=True)
+        else:
+            messagebox.showinfo("Profil créé", details)
+
+    def transfer_profile_data(self, skip_confirmation: bool = False) -> None:
+        old_profile = self.profile_by_label.get(self.migrate_from_var.get())
+        new_profile = self.profile_by_label.get(self.migrate_to_var.get())
+        if old_profile is None or new_profile is None:
+            messagebox.showerror(
+                "Profils manquants",
+                "Sélectionne un profil source et un profil destination.",
+            )
+            return
+        if old_profile.path.resolve(strict=False) == new_profile.path.resolve(strict=False):
+            messagebox.showerror(
+                "Migration impossible",
+                "Le profil source et le profil destination doivent être différents.",
+            )
+            return
+        if firefox_processes():
+            messagebox.showerror(
+                "Firefox est ouvert",
+                "Ferme complètement Firefox avant le transfert.",
+            )
+            return
+
+        plan = migration_plan(old_profile.path, new_profile.path)
+        present = [name for name, source_exists, _ in plan if source_exists]
+        replaced = [name for name, _, destination_exists in plan if destination_exists]
+        details = (
+            f"Depuis : {old_profile.name}\n"
+            f"Vers : {new_profile.name}\n\n"
+            f"Fichiers disponibles : {', '.join(present) or 'aucun'}.\n"
+            "Les extensions et prefs.js ne seront pas copiés."
+        )
+        if replaced:
+            details += (
+                "\n\nLes fichiers déjà présents dans la destination seront sauvegardés : "
+                + ", ".join(replaced)
+                + "."
+            )
+        details += (
+            "\n\nLes cookies récupèrent souvent les sessions, mais certains sites "
+            "peuvent demander une nouvelle authentification."
+        )
+        if not skip_confirmation and not messagebox.askyesno(
+            "Confirmer le transfert",
+            details,
+        ):
+            return
+
+        try:
+            result = migrate_profile_data(old_profile.path, new_profile.path)
+        except ValueError as error:
+            messagebox.showerror("Migration impossible", str(error))
+            return
+
+        report = f"Fichiers copiés : {', '.join(result.copied) or 'aucun'}."
+        if result.skipped:
+            report += "\n\nIgnorés :\n" + "\n".join(result.skipped)
+        if result.backup_dir:
+            report += f"\n\nSauvegarde de la destination : {result.backup_dir}"
+        if result.errors:
+            report += "\n\nErreurs :\n" + "\n".join(result.errors)
+            messagebox.showwarning("Transfert partiel", report)
+        else:
+            messagebox.showinfo(
+                "Transfert terminé",
+                report + "\n\nTu peux maintenant lancer le nouveau profil.",
+            )
 
     def scan(self) -> None:
         for row in self.tree.get_children():
