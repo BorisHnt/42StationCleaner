@@ -1,0 +1,762 @@
+#!/usr/bin/env python3
+"""Repair Firefox caches and extension registries without resetting user data."""
+
+import argparse
+import configparser
+import json
+import os
+import shutil
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+except ImportError:
+    tk = None
+    messagebox = None
+    ttk = None
+
+
+FIREFOX_DIR = Path.home() / ".mozilla/firefox"
+CACHE_BASE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+CACHE_ROOT = CACHE_BASE / "mozilla/firefox"
+BACKUP_DIR_NAME = "MozillaFirefoxCacheBugfix-backups"
+
+# These directories contain generated data. Firefox recreates them as needed.
+CACHE_DIR_NAMES = (
+    "cache2",
+    "startupCache",
+    "shader-cache",
+    "jumpListCache",
+    "OfflineCache",
+)
+
+# These files describe the local Firefox/add-on installation. They can contain
+# machine-specific paths and are rebuilt from the installed XPI files.
+EXTENSION_REGISTRY_FILES = (
+    "addonStartup.json.lz4",
+    "compatibility.ini",
+    "extensions.json",
+    "extensions.ini",
+    "extensions.sqlite",
+    "extensions.sqlite-journal",
+)
+
+MIGRATION_FILES = (
+    "logins.json",
+    "key4.db",
+    "cookies.sqlite",
+    "places.sqlite",
+    "favicons.sqlite",
+    "formhistory.sqlite",
+)
+
+
+@dataclass(frozen=True)
+class FirefoxProfile:
+    name: str
+    path: Path
+    is_default: bool = False
+
+
+@dataclass(frozen=True)
+class RepairItem:
+    path: Path
+    category: str
+    action: str
+    size: int
+    reason: str
+
+
+@dataclass
+class RepairResult:
+    removed: int = 0
+    backed_up: int = 0
+    quarantined: int = 0
+    freed: int = 0
+    backup_dir: Path | None = None
+    quarantine_paths: list[Path] | None = None
+    errors: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.quarantine_paths is None:
+            self.quarantine_paths = []
+        if self.errors is None:
+            self.errors = []
+
+
+@dataclass
+class MigrationResult:
+    copied: list[str]
+    skipped: list[str]
+    backup_dir: Path | None
+    errors: list[str]
+
+
+def human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "K", "M", "G", "T"):
+        if value < 1024 or unit == "T":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return f"{size}B"
+
+
+def path_size(path: Path) -> int:
+    if path.is_symlink() or path.is_file():
+        try:
+            return path.lstat().st_size
+        except OSError:
+            return 0
+
+    total = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
+        for name in files:
+            try:
+                total += (Path(root) / name).lstat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def read_ini(path: Path) -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(path, encoding="utf-8")
+    except (OSError, configparser.Error):
+        pass
+    return parser
+
+
+def resolve_profile_path(root: Path, raw_path: str, is_relative: bool) -> Path:
+    path = Path(raw_path).expanduser()
+    return root / path if is_relative else path
+
+
+def discover_profiles(root: Path = FIREFOX_DIR) -> list[FirefoxProfile]:
+    profiles_ini = read_ini(root / "profiles.ini")
+    installs_ini = read_ini(root / "installs.ini")
+    install_defaults = {
+        section.get("Default", "")
+        for section in installs_ini.values()
+        if section.get("Default", "")
+    }
+
+    profiles = []
+    seen: set[Path] = set()
+    for section_name in profiles_ini.sections():
+        if not section_name.startswith("Profile"):
+            continue
+        section = profiles_ini[section_name]
+        raw_path = section.get("Path", "").strip()
+        if not raw_path:
+            continue
+        is_relative = section.getboolean("IsRelative", fallback=True)
+        path = resolve_profile_path(root, raw_path, is_relative)
+        path_key = path.resolve(strict=False)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        profiles.append(
+            FirefoxProfile(
+                name=section.get("Name", path.name),
+                path=path,
+                is_default=raw_path in install_defaults
+                or (
+                    not install_defaults
+                    and section.getboolean("Default", fallback=False)
+                ),
+            )
+        )
+
+    if not profiles and root.exists():
+        for path in sorted(root.glob("*.default*")):
+            if path.is_dir():
+                profiles.append(FirefoxProfile(path.name, path, False))
+
+    return sorted(profiles, key=lambda profile: (not profile.is_default, profile.name, str(profile.path)))
+
+
+def firefox_processes() -> list[tuple[int, str]]:
+    proc = Path("/proc")
+    if not proc.exists():
+        return []
+
+    current_uid = os.getuid()
+    found = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != current_uid:
+                continue
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        args = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        executable = Path(args[0]).name.lower()
+        command = " ".join(args)
+        if executable in {"firefox", "firefox-bin"} or "/firefox" in args[0].lower():
+            found.append((int(entry.name), command))
+    return sorted(found)
+
+
+def scan_profile(
+    profile: FirefoxProfile,
+    include_cache: bool = True,
+    include_extensions: bool = True,
+    cache_root: Path = CACHE_ROOT,
+) -> list[RepairItem]:
+    items = []
+    if include_cache:
+        for name in CACHE_DIR_NAMES:
+            path = profile.path / name
+            if path.exists() or path.is_symlink():
+                items.append(
+                    RepairItem(
+                        path=path,
+                        category="cache",
+                        action="delete",
+                        size=path_size(path),
+                        reason="cache régénérable par Firefox",
+                    )
+                )
+        external_profile_cache = cache_root / profile.path.name
+        if external_profile_cache.exists() or external_profile_cache.is_symlink():
+            items.append(
+                RepairItem(
+                    path=external_profile_cache,
+                    category="cache local",
+                    action="quarantine",
+                    size=path_size(external_profile_cache),
+                    reason="cache propre à ce poste, renommé en .bak pour permettre un retour arrière",
+                )
+            )
+
+    if include_extensions:
+        for name in EXTENSION_REGISTRY_FILES:
+            path = profile.path / name
+            if path.exists() or path.is_symlink():
+                items.append(
+                    RepairItem(
+                        path=path,
+                        category="extensions",
+                        action="backup",
+                        size=path_size(path),
+                        reason="registre local reconstruit depuis les extensions installées",
+                    )
+                )
+    return items
+
+
+def is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(directory.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def profile_warnings(profile: FirefoxProfile, home: Path | None = None) -> list[str]:
+    warnings = []
+    home = home or Path.home()
+    if is_within(profile.path, Path("/tmp")):
+        warnings.append("le répertoire racine du profil est temporaire")
+    elif not is_within(profile.path, home):
+        warnings.append(
+            "le répertoire racine du profil est hors du home persistant"
+        )
+
+    extensions_json = profile.path / "extensions.json"
+    if extensions_json.exists():
+        try:
+            data = json.loads(extensions_json.read_text(encoding="utf-8"))
+            invalid_paths = 0
+            for addon in data.get("addons", []):
+                raw_path = addon.get("path")
+                if raw_path and Path(raw_path).is_absolute() and not Path(raw_path).exists():
+                    invalid_paths += 1
+            if invalid_paths:
+                warnings.append(
+                    f"{invalid_paths} chemin(s) d'extension absolu(s) ne correspondent pas à ce poste"
+                )
+        except (OSError, json.JSONDecodeError):
+            warnings.append("extensions.json est illisible ou invalide")
+
+    duplicate_prefs = sorted(profile.path.glob("prefs-[0-9]*.js"))
+    if duplicate_prefs:
+        warnings.append(
+            f"{len(duplicate_prefs)} copie(s) prefs-N.js détectée(s), signe possible de conflits de synchronisation"
+        )
+    return warnings
+
+
+def migration_plan(old_profile: Path, new_profile: Path) -> list[tuple[str, bool, bool]]:
+    return [
+        (name, (old_profile / name).exists(), (new_profile / name).exists())
+        for name in MIGRATION_FILES
+    ]
+
+
+def migrate_profile_data(
+    old_profile: Path,
+    new_profile: Path,
+    timestamp: str | None = None,
+) -> MigrationResult:
+    old_profile = old_profile.expanduser().resolve(strict=False)
+    new_profile = new_profile.expanduser().resolve(strict=False)
+    if old_profile == new_profile:
+        raise ValueError("les profils source et destination sont identiques")
+    if not old_profile.is_dir():
+        raise ValueError(f"profil source introuvable: {old_profile}")
+    if not new_profile.is_dir():
+        raise ValueError(f"profil destination introuvable: {new_profile}")
+
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir = new_profile / f"backup-before-transfer-{timestamp}"
+    result = MigrationResult(copied=[], skipped=[], backup_dir=None, errors=[])
+
+    password_files = ("logins.json", "key4.db")
+    password_pair_complete = all((old_profile / name).is_file() for name in password_files)
+
+    for name in MIGRATION_FILES:
+        source = old_profile / name
+        destination = new_profile / name
+        if name in password_files and not password_pair_complete:
+            result.skipped.append(f"{name}: paire logins.json/key4.db incomplète")
+            continue
+        if source.is_symlink():
+            result.skipped.append(f"{name}: lien symbolique source refusé")
+            continue
+        if not source.is_file():
+            result.skipped.append(f"{name}: absent de la source")
+            continue
+        sidecars = (
+            [Path(f"{destination}{suffix}") for suffix in ("-wal", "-shm", "-journal")]
+            if name.endswith(".sqlite")
+            else []
+        )
+        unsafe_sidecar = next((path for path in sidecars if path.is_symlink()), None)
+        if unsafe_sidecar:
+            result.errors.append(
+                f"{unsafe_sidecar.name}: lien symbolique destination refusé"
+            )
+            continue
+        try:
+            if destination.is_symlink():
+                result.errors.append(f"{name}: lien symbolique destination refusé")
+                continue
+            if destination.exists():
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destination, backup_dir / name)
+                result.backup_dir = backup_dir
+            for sidecar in sidecars:
+                if sidecar.exists():
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(sidecar), str(backup_dir / sidecar.name))
+                    result.backup_dir = backup_dir
+            shutil.copy2(source, destination)
+            result.copied.append(name)
+        except OSError as error:
+            result.errors.append(f"{name}: {error}")
+    return result
+
+
+def backup_destination(backup_dir: Path, profile: FirefoxProfile, item: RepairItem) -> Path:
+    return backup_dir / profile.path.name / item.path.name
+
+
+def quarantine_destination(path: Path, timestamp: str) -> Path:
+    destination = path.with_name(f"{path.name}.bak-{timestamp}")
+    suffix = 1
+    while destination.exists() or destination.is_symlink():
+        destination = path.with_name(f"{path.name}.bak-{timestamp}-{suffix}")
+        suffix += 1
+    return destination
+
+
+def repair_profile(
+    profile: FirefoxProfile,
+    items: list[RepairItem],
+    backup_root: Path | None = None,
+) -> RepairResult:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_root = backup_root or profile.path.parent / BACKUP_DIR_NAME
+    backup_dir = backup_root / timestamp
+    result = RepairResult(backup_dir=backup_dir)
+
+    for item in items:
+        if not item.path.exists() and not item.path.is_symlink():
+            continue
+        try:
+            size = path_size(item.path)
+            if item.action == "backup":
+                destination = backup_destination(backup_dir, profile, item)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    destination = destination.with_name(f"{destination.name}-{timestamp}")
+                shutil.move(str(item.path), str(destination))
+                result.backed_up += 1
+            elif item.action == "quarantine":
+                destination = quarantine_destination(item.path, timestamp)
+                shutil.move(str(item.path), str(destination))
+                result.quarantined += 1
+                result.quarantine_paths.append(destination)
+            else:
+                remove_path(item.path)
+                result.removed += 1
+                result.freed += size
+        except OSError as error:
+            result.errors.append(f"{item.path}: {error}")
+
+    if result.backed_up == 0:
+        result.backup_dir = None
+        try:
+            backup_dir.rmdir()
+        except OSError:
+            pass
+    return result
+
+
+def select_profiles(
+    profiles: list[FirefoxProfile],
+    explicit_path: str | None,
+    all_profiles: bool,
+) -> list[FirefoxProfile]:
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        return [FirefoxProfile(path.name, path, True)]
+    if all_profiles:
+        return profiles
+    defaults = [profile for profile in profiles if profile.is_default]
+    if defaults:
+        return defaults
+    return profiles[:1]
+
+
+def print_scan(profiles: list[FirefoxProfile], include_cache: bool, include_extensions: bool) -> None:
+    for profile in profiles:
+        default = " [défaut]" if profile.is_default else ""
+        print(f"\nProfil: {profile.name}{default}\nChemin: {profile.path}")
+        for warning in profile_warnings(profile):
+            print(f"ATTENTION: {warning}")
+        items = scan_profile(profile, include_cache, include_extensions)
+        if not items:
+            print("Aucun cache ou registre ciblé trouvé.")
+            continue
+        for item in items:
+            action_label = {
+                "delete": "delete",
+                "backup": "backup",
+                "quarantine": "rename",
+            }[item.action]
+            print(
+                f"{action_label:6} {human_size(item.size):>8} "
+                f"{item.category:10} {item.path} ({item.reason})"
+            )
+        print(f"Total ciblé: {human_size(sum(item.size for item in items))}")
+
+
+class App:
+    def __init__(self, root: "tk.Tk") -> None:
+        self.root = root
+        self.root.title("Mozilla Firefox Cache Bugfix")
+        self.profiles = discover_profiles()
+        self.profile_by_label = {
+            self.profile_label(profile): profile for profile in self.profiles
+        }
+        self.profile_var = tk.StringVar()
+        self.use_cache = tk.BooleanVar(value=True)
+        self.use_extensions = tk.BooleanVar(value=False)
+        self.summary = tk.StringVar(value="Prêt.")
+        self.items: list[RepairItem] = []
+
+        controls = ttk.Frame(root, padding=10)
+        controls.pack(fill=tk.X)
+        ttk.Label(controls, text="Profil Firefox:").pack(side=tk.LEFT)
+        self.profile_box = ttk.Combobox(
+            controls,
+            textvariable=self.profile_var,
+            values=list(self.profile_by_label),
+            state="readonly",
+            width=70,
+        )
+        self.profile_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        self.profile_box.bind("<<ComboboxSelected>>", lambda event: self.scan())
+
+        if self.profile_by_label:
+            self.profile_var.set(next(iter(self.profile_by_label)))
+
+        options = ttk.Frame(root, padding=(10, 0, 10, 8))
+        options.pack(fill=tk.X)
+        ttk.Checkbutton(
+            options,
+            text="Caches régénérables",
+            variable=self.use_cache,
+            command=self.scan,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            options,
+            text="Reconstruire le registre des extensions",
+            variable=self.use_extensions,
+            command=self.scan,
+        ).pack(side=tk.LEFT, padx=12)
+        ttk.Button(options, text="Scanner", command=self.scan).pack(side=tk.LEFT)
+        ttk.Button(options, text="Réparer", command=self.repair).pack(side=tk.LEFT, padx=8)
+
+        ttk.Label(
+            root,
+            text=(
+                "Les extensions, marque-pages, mots de passe, cookies et données de sites "
+                "ne sont pas supprimés."
+            ),
+            padding=(10, 0, 10, 8),
+        ).pack(fill=tk.X)
+        ttk.Label(root, textvariable=self.summary, padding=(10, 0, 10, 8)).pack(fill=tk.X)
+
+        columns = ("action", "size", "category", "reason", "path")
+        self.tree = ttk.Treeview(root, columns=columns, show="headings", height=18)
+        for column, title, width in (
+            ("action", "Action", 85),
+            ("size", "Taille", 90),
+            ("category", "Catégorie", 100),
+            ("reason", "Raison", 360),
+            ("path", "Chemin", 600),
+        ):
+            self.tree.heading(column, text=title)
+            self.tree.column(column, width=width, anchor=tk.W)
+        self.tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.scan()
+
+    @staticmethod
+    def profile_label(profile: FirefoxProfile) -> str:
+        default = " [défaut]" if profile.is_default else ""
+        return f"{profile.name}{default} - {profile.path}"
+
+    def selected_profile(self) -> FirefoxProfile | None:
+        return self.profile_by_label.get(self.profile_var.get())
+
+    def scan(self) -> None:
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        profile = self.selected_profile()
+        if profile is None:
+            self.items = []
+            self.summary.set("Aucun profil Firefox trouvé.")
+            return
+
+        self.items = scan_profile(profile, self.use_cache.get(), self.use_extensions.get())
+        for index, item in enumerate(self.items):
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(
+                    {
+                        "delete": "supprimer",
+                        "backup": "sauvegarder",
+                        "quarantine": "renommer",
+                    }[item.action],
+                    human_size(item.size),
+                    item.category,
+                    item.reason,
+                    str(item.path),
+                ),
+            )
+        warnings = profile_warnings(profile)
+        warning_text = f" Attention: {'; '.join(warnings)}." if warnings else ""
+        self.summary.set(
+            f"{len(self.items)} élément(s), {human_size(sum(item.size for item in self.items))} ciblés."
+            f"{warning_text}"
+        )
+
+    def repair(self) -> None:
+        profile = self.selected_profile()
+        if profile is None or not self.items:
+            messagebox.showinfo("Rien à faire", "Aucun élément réparable trouvé.")
+            return
+        processes = firefox_processes()
+        if processes:
+            messagebox.showerror(
+                "Firefox est ouvert",
+                "Ferme complètement Firefox avant la réparation.\n\n"
+                f"{len(processes)} processus Firefox détecté(s).",
+            )
+            return
+        if not messagebox.askyesno(
+            "Confirmation",
+            f"Réparer le profil {profile.name} ?\n\n"
+            "Le cache local sera renommé en .bak avant que Firefox en recrée un propre."
+            + (
+                "\nLes registres d'extensions seront aussi sauvegardés et reconstruits."
+                if self.use_extensions.get()
+                else ""
+            ),
+        ):
+            return
+
+        result = repair_profile(profile, self.items)
+        details = (
+            f"{result.quarantined} cache(s) local(aux) renommé(s), "
+            f"{result.removed} petit(s) cache(s) supprimé(s), "
+            f"{result.backed_up} fichier(s) sauvegardé(s), "
+            f"{human_size(result.freed)} libérés."
+        )
+        if result.quarantine_paths:
+            details += "\n\nCache(s) de secours:\n" + "\n".join(
+                str(path) for path in result.quarantine_paths
+            )
+        if result.backup_dir:
+            details += f"\n\nRegistres sauvegardés: {result.backup_dir}"
+        if result.errors:
+            details += "\n\nErreurs:\n" + "\n".join(result.errors)
+            messagebox.showwarning("Réparation partielle", details)
+        else:
+            details += "\n\nRelance Firefox. Le premier démarrage peut être plus lent."
+            messagebox.showinfo("Réparation terminée", details)
+        self.scan()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Répare les caches et le registre des extensions Firefox."
+    )
+    parser.add_argument("--scan", action="store_true", help="affiche les éléments ciblés")
+    parser.add_argument("--repair", action="store_true", help="effectue la réparation")
+    parser.add_argument("--yes", action="store_true", help="confirme la réparation en ligne de commande")
+    parser.add_argument("--all-profiles", action="store_true", help="traite tous les profils détectés")
+    parser.add_argument("--profile", metavar="PATH", help="traite explicitement ce profil")
+    parser.add_argument("--cache-only", action="store_true", help="ne traite que les caches")
+    parser.add_argument(
+        "--include-extensions",
+        action="store_true",
+        help="reconstruit aussi le registre des extensions (option avancée)",
+    )
+    parser.add_argument(
+        "--extensions-only",
+        action="store_true",
+        help="ne reconstruit que le registre des extensions",
+    )
+    parser.add_argument(
+        "--migrate-from",
+        metavar="PATH",
+        help="ancien profil dont copier les données personnelles utiles",
+    )
+    parser.add_argument(
+        "--migrate-to",
+        metavar="PATH",
+        help="nouveau profil propre recevant les données",
+    )
+    return parser
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if bool(args.migrate_from) != bool(args.migrate_to):
+        parser.error("--migrate-from et --migrate-to doivent être utilisés ensemble")
+    if args.cache_only and args.extensions_only:
+        parser.error("--cache-only et --extensions-only sont incompatibles")
+    if args.cache_only and args.include_extensions:
+        parser.error("--cache-only et --include-extensions sont incompatibles")
+
+    include_cache = not args.extensions_only
+    include_extensions = args.extensions_only or args.include_extensions
+    profiles = select_profiles(discover_profiles(), args.profile, args.all_profiles)
+
+    if args.migrate_from and args.migrate_to:
+        old_profile = Path(args.migrate_from)
+        new_profile = Path(args.migrate_to)
+        print(f"Migration sélective:\n  source: {old_profile}\n  destination: {new_profile}")
+        for name, source_exists, destination_exists in migration_plan(old_profile, new_profile):
+            source_state = "présent" if source_exists else "absent"
+            backup_state = ", destination sauvegardée" if destination_exists else ""
+            print(f"  {name:20} {source_state}{backup_state}")
+        print("\nLes extensions et prefs.js ne seront pas copiés.")
+        if not args.yes:
+            print("\nAjoute --yes pour confirmer la migration.", file=sys.stderr)
+            return 2
+        processes = firefox_processes()
+        if processes:
+            print("\nMigration refusée: Firefox est encore ouvert.", file=sys.stderr)
+            return 3
+        try:
+            result = migrate_profile_data(old_profile, new_profile)
+        except ValueError as error:
+            print(f"\nMigration refusée: {error}", file=sys.stderr)
+            return 1
+        print(f"\nFichiers copiés: {', '.join(result.copied) or 'aucun'}")
+        for skipped in result.skipped:
+            print(f"IGNORÉ: {skipped}")
+        if result.backup_dir:
+            print(f"Sauvegarde de la destination: {result.backup_dir}")
+        for error in result.errors:
+            print(f"ERREUR: {error}", file=sys.stderr)
+        return 1 if result.errors else 0
+
+    if args.scan or args.repair:
+        if not profiles:
+            print("Aucun profil Firefox trouvé.", file=sys.stderr)
+            return 1
+        print_scan(profiles, include_cache, include_extensions)
+        if not args.repair:
+            return 0
+        if not args.yes:
+            print("\nAjoute --yes pour confirmer la réparation.", file=sys.stderr)
+            return 2
+        processes = firefox_processes()
+        if processes:
+            print("\nRéparation refusée: Firefox est encore ouvert.", file=sys.stderr)
+            for pid, command in processes[:5]:
+                print(f"  PID {pid}: {command}", file=sys.stderr)
+            if len(processes) > 5:
+                print(
+                    f"  ... et {len(processes) - 5} autre(s) processus Firefox.",
+                    file=sys.stderr,
+                )
+            return 3
+
+        failed = False
+        for profile in profiles:
+            items = scan_profile(profile, include_cache, include_extensions)
+            result = repair_profile(profile, items)
+            print(
+                f"\n{profile.name}: {result.quarantined} cache(s) local(aux) renommé(s), "
+                f"{result.removed} petit(s) cache(s) supprimé(s), "
+                f"{result.backed_up} registre(s) sauvegardé(s), "
+                f"{human_size(result.freed)} libérés."
+            )
+            for path in result.quarantine_paths:
+                print(f"Cache de secours: {path}")
+            if result.backup_dir:
+                print(f"Registres sauvegardés: {result.backup_dir}")
+            for error in result.errors:
+                failed = True
+                print(f"ERREUR: {error}", file=sys.stderr)
+        return 1 if failed else 0
+
+    if tk is None:
+        print("Tkinter n'est pas disponible. Utilise --scan ou --repair --yes.", file=sys.stderr)
+        return 1
+    root = tk.Tk()
+    root.geometry("1300x620")
+    App(root)
+    root.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
