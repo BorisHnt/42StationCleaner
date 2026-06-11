@@ -58,6 +58,25 @@ MIGRATION_FILES = (
     "formhistory.sqlite",
 )
 
+PROFILE_MARKER_FILES = (
+    "places.sqlite",
+    "cookies.sqlite",
+    "key4.db",
+    "extensions.json",
+    "logins.json",
+)
+
+SEARCH_PRUNE_DIRS = {
+    ".cache",
+    ".git",
+    ".local/share/Trash",
+    "Cache",
+    "cache2",
+    "Code Cache",
+    "node_modules",
+    "startupCache",
+}
+
 
 @dataclass(frozen=True)
 class FirefoxProfile:
@@ -204,6 +223,67 @@ def discover_profiles(root: Path = FIREFOX_DIR) -> list[FirefoxProfile]:
                 profiles.append(FirefoxProfile(path.name, path, False))
 
     return sorted(profiles, key=lambda profile: (not profile.is_default, profile.name, str(profile.path)))
+
+
+def default_profile_search_roots() -> list[Path]:
+    roots = [Path.home()]
+    goinfre = Path("/goinfre") / Path.home().name
+    if goinfre.is_dir() and goinfre.resolve(strict=False) != Path.home().resolve(strict=False):
+        roots.append(goinfre)
+    return roots
+
+
+def is_firefox_profile_directory(path: Path) -> bool:
+    if not (path / "prefs.js").is_file():
+        return False
+    return any((path / marker).exists() for marker in PROFILE_MARKER_FILES)
+
+
+def find_firefox_profiles(
+    search_roots: list[Path] | None = None,
+    known_profiles: list[FirefoxProfile] | None = None,
+) -> list[FirefoxProfile]:
+    if known_profiles is None:
+        known_profiles = discover_profiles()
+    profiles_by_path = {
+        profile.path.resolve(strict=False): profile for profile in known_profiles
+    }
+
+    for search_root in search_roots or default_profile_search_roots():
+        search_root = search_root.expanduser().resolve(strict=False)
+        if not search_root.is_dir():
+            continue
+        for root, dirs, _files in os.walk(search_root, followlinks=False):
+            directory = Path(root)
+            relative_parts = directory.relative_to(search_root).parts
+            relative_path = "/".join(relative_parts)
+            dirs[:] = [
+                name
+                for name in dirs
+                if not (directory / name).is_symlink()
+                and name not in SEARCH_PRUNE_DIRS
+                and "/".join((*relative_parts, name)) not in SEARCH_PRUNE_DIRS
+                and not name.startswith(f"{BACKUP_DIR_NAME}")
+                and not name.startswith("backup-before-transfer-")
+            ]
+            if relative_path in SEARCH_PRUNE_DIRS:
+                dirs.clear()
+                continue
+            if not is_firefox_profile_directory(directory):
+                continue
+            resolved = directory.resolve(strict=False)
+            if resolved not in profiles_by_path:
+                profiles_by_path[resolved] = FirefoxProfile(
+                    name=directory.name,
+                    path=directory,
+                    is_default=False,
+                )
+            dirs.clear()
+
+    return sorted(
+        profiles_by_path.values(),
+        key=lambda profile: (not profile.is_default, profile.name, str(profile.path)),
+    )
 
 
 def valid_profile_name(name: str) -> str:
@@ -620,6 +700,11 @@ class App:
             text="Créer un profil",
             command=self.create_profile,
         ).pack(side=tk.LEFT)
+        ttk.Button(
+            controls,
+            text="Retrouver les profils",
+            command=self.find_profiles,
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         if self.profile_by_label:
             self.profile_var.set(next(iter(self.profile_by_label)))
@@ -730,8 +815,9 @@ class App:
         selected_path: Path | None = None,
         migrate_from: Path | None = None,
         migrate_to: Path | None = None,
+        profiles: list[FirefoxProfile] | None = None,
     ) -> None:
-        self.profiles = discover_profiles()
+        self.profiles = profiles if profiles is not None else discover_profiles()
         self.profile_by_label = {
             self.profile_label(profile): profile for profile in self.profiles
         }
@@ -756,6 +842,27 @@ class App:
         )
         self.migrate_to_var.set(to_label)
         self.scan()
+
+    def find_profiles(self) -> None:
+        selected = self.selected_profile()
+        self.summary.set("Recherche des profils Firefox en cours...")
+        self.root.update_idletasks()
+        profiles = find_firefox_profiles(known_profiles=self.profiles)
+        found_count = len(profiles) - len(self.profiles)
+        self.reload_profiles(
+            selected_path=selected.path if selected else None,
+            profiles=profiles,
+        )
+        if found_count:
+            messagebox.showinfo(
+                "Recherche terminée",
+                f"{found_count} profil(s) Firefox supplémentaire(s) trouvé(s).",
+            )
+        else:
+            messagebox.showinfo(
+                "Recherche terminée",
+                "Aucun profil Firefox supplémentaire trouvé.",
+            )
 
     def create_profile(self) -> None:
         if firefox_processes():
@@ -959,6 +1066,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true", help="confirme la réparation en ligne de commande")
     parser.add_argument("--all-profiles", action="store_true", help="traite tous les profils détectés")
     parser.add_argument("--profile", metavar="PATH", help="traite explicitement ce profil")
+    parser.add_argument(
+        "--find-profiles",
+        action="store_true",
+        help="recherche les profils déplacés dans le home et le goinfre",
+    )
+    parser.add_argument(
+        "--search-root",
+        action="append",
+        metavar="PATH",
+        help="racine à parcourir avec --find-profiles (option répétable)",
+    )
     parser.add_argument("--cache-only", action="store_true", help="ne traite que les caches")
     parser.add_argument(
         "--include-extensions",
@@ -1005,6 +1123,8 @@ def main(argv: list[str]) -> int:
         or args.migrate_to
         or args.profile
         or args.all_profiles
+        or args.find_profiles
+        or args.search_root
         or args.cache_only
         or args.include_extensions
         or args.extensions_only
@@ -1016,10 +1136,28 @@ def main(argv: list[str]) -> int:
         parser.error("--cache-only et --extensions-only sont incompatibles")
     if args.cache_only and args.include_extensions:
         parser.error("--cache-only et --include-extensions sont incompatibles")
+    if args.search_root and not args.find_profiles:
+        parser.error("--search-root nécessite --find-profiles")
 
     include_cache = not args.extensions_only
     include_extensions = args.extensions_only or args.include_extensions
-    profiles = select_profiles(discover_profiles(), args.profile, args.all_profiles)
+    discovered_profiles = discover_profiles()
+    if args.find_profiles:
+        search_roots = (
+            [Path(path) for path in args.search_root]
+            if args.search_root
+            else default_profile_search_roots()
+        )
+        discovered_profiles = find_firefox_profiles(search_roots, discovered_profiles)
+        print("Profils Firefox détectés:")
+        for profile in discovered_profiles:
+            default = " [défaut]" if profile.is_default else ""
+            print(f"  {profile.name}{default}: {profile.path}")
+        if not discovered_profiles:
+            print("  aucun")
+        if not args.scan and not args.repair:
+            return 0
+    profiles = select_profiles(discovered_profiles, args.profile, args.all_profiles)
 
     if args.create_profile:
         try:

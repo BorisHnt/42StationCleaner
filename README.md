@@ -69,6 +69,7 @@ Répare les corruptions Firefox qui peuvent apparaître quand un même profil ut
 est utilisé sur plusieurs postes :
 
 - détecte automatiquement les profils via `profiles.ini` ;
+- peut rechercher les profils déplacés dans le home ou le `goinfre` ;
 - renomme le cache local du poste en `.bak-<date>` pour permettre un retour arrière ;
 - supprime uniquement les petits caches régénérables présents dans le profil ;
 - peut reconstruire, en option avancée, le registre local des extensions sans supprimer
@@ -90,12 +91,20 @@ données utiles depuis l'ancien profil.
 La section `Transfert vers un profil propre` permet aussi de choisir manuellement un
 profil source, un profil destination, puis de lancer le transfert.
 
+Le bouton `Retrouver les profils` parcourt le home et le `goinfre` de l'utilisateur pour
+détecter les profils Firefox déplacés qui ne sont plus référencés par `profiles.ini`.
+
 Diagnostic en ligne de commande :
 
 ```bash
 python3 MozillaFirefoxCacheBugfix.py --scan
 python3 MozillaFirefoxCacheBugfix.py --scan --all-profiles
+python3 MozillaFirefoxCacheBugfix.py --find-profiles
+python3 MozillaFirefoxCacheBugfix.py --find-profiles --scan --all-profiles
 ```
+
+Pour limiter la recherche à un emplacement précis, utiliser une ou plusieurs fois
+`--search-root PATH`.
 
 Réparation après avoir complètement fermé Firefox :
 
