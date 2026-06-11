@@ -83,6 +83,9 @@ Lancer l'interface :
 python3 MozillaFirefoxCacheBugfix.py
 ```
 
+Le bouton `Créer un profil` génère un profil persistant sous `~/.mozilla/firefox` et
+propose de le définir comme profil par défaut.
+
 Diagnostic en ligne de commande :
 
 ```bash
@@ -97,6 +100,14 @@ python3 MozillaFirefoxCacheBugfix.py --repair --yes
 python3 MozillaFirefoxCacheBugfix.py --repair --yes --include-extensions
 python3 MozillaFirefoxCacheBugfix.py --repair --yes --extensions-only
 ```
+
+Créer directement un profil persistant :
+
+```bash
+python3 MozillaFirefoxCacheBugfix.py --create-profile 42-persistent --yes
+```
+
+Ajouter `--no-default` pour le créer sans remplacer le profil par défaut.
 
 Par défaut, seule la réparation éprouvée du cache local au poste est appliquée. Utiliser
 `--include-extensions` uniquement si les extensions restent invisibles ou inactives après

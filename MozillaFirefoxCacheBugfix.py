@@ -5,7 +5,10 @@ import argparse
 import configparser
 import json
 import os
+import re
+import secrets
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -13,10 +16,11 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import messagebox, simpledialog, ttk
 except ImportError:
     tk = None
     messagebox = None
+    simpledialog = None
     ttk = None
 
 
@@ -96,6 +100,12 @@ class MigrationResult:
     errors: list[str]
 
 
+@dataclass(frozen=True)
+class CreatedProfile:
+    profile: FirefoxProfile
+    made_default: bool
+
+
 def human_size(size: int) -> str:
     value = float(size)
     for unit in ("B", "K", "M", "G", "T"):
@@ -132,11 +142,19 @@ def remove_path(path: Path) -> None:
 
 def read_ini(path: Path) -> configparser.ConfigParser:
     parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
     try:
         parser.read(path, encoding="utf-8")
     except (OSError, configparser.Error):
         pass
     return parser
+
+
+def write_ini(path: Path, parser: configparser.ConfigParser) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with temporary.open("w", encoding="utf-8") as handle:
+        parser.write(handle, space_around_delimiters=False)
+    os.replace(temporary, path)
 
 
 def resolve_profile_path(root: Path, raw_path: str, is_relative: bool) -> Path:
@@ -186,6 +204,105 @@ def discover_profiles(root: Path = FIREFOX_DIR) -> list[FirefoxProfile]:
                 profiles.append(FirefoxProfile(path.name, path, False))
 
     return sorted(profiles, key=lambda profile: (not profile.is_default, profile.name, str(profile.path)))
+
+
+def valid_profile_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise ValueError("le nom du profil est vide")
+    if len(name) > 64:
+        raise ValueError("le nom du profil dépasse 64 caractères")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise ValueError(
+            "le nom du profil doit contenir uniquement lettres ASCII, chiffres, '.', '_' ou '-'"
+        )
+    return name
+
+
+def set_default_profile(profile: FirefoxProfile, root: Path = FIREFOX_DIR) -> None:
+    profiles_ini_path = root / "profiles.ini"
+    profiles_ini = read_ini(profiles_ini_path)
+    relative_path = os.path.relpath(profile.path, root)
+    matched = False
+
+    for section_name in profiles_ini.sections():
+        if not section_name.startswith("Profile"):
+            continue
+        section = profiles_ini[section_name]
+        raw_path = section.get("Path", "")
+        is_relative = section.getboolean("IsRelative", fallback=True)
+        section_path = resolve_profile_path(root, raw_path, is_relative).resolve(strict=False)
+        is_selected = section_path == profile.path.resolve(strict=False)
+        if is_selected:
+            section["Default"] = "1"
+            matched = True
+        else:
+            section.pop("Default", None)
+
+    if not matched:
+        raise ValueError("le profil créé n'est pas enregistré dans profiles.ini")
+
+    for section_name in profiles_ini.sections():
+        if section_name.startswith("Install"):
+            profiles_ini[section_name]["Default"] = relative_path
+            profiles_ini[section_name]["Locked"] = "1"
+    write_ini(profiles_ini_path, profiles_ini)
+
+    installs_ini_path = root / "installs.ini"
+    installs_ini = read_ini(installs_ini_path)
+    for section_name in installs_ini.sections():
+        installs_ini[section_name]["Default"] = relative_path
+        installs_ini[section_name]["Locked"] = "1"
+    if installs_ini.sections():
+        write_ini(installs_ini_path, installs_ini)
+
+
+def create_firefox_profile(
+    name: str,
+    make_default: bool = True,
+    root: Path = FIREFOX_DIR,
+    firefox_binary: str | None = None,
+) -> CreatedProfile:
+    name = valid_profile_name(name)
+    if any(profile.name.casefold() == name.casefold() for profile in discover_profiles(root)):
+        raise ValueError(f"un profil nommé {name!r} existe déjà")
+
+    root.mkdir(parents=True, exist_ok=True)
+    while True:
+        profile_path = root / f"{secrets.token_hex(4)}.{name}"
+        if not profile_path.exists():
+            break
+
+    firefox_binary = firefox_binary or shutil.which("firefox")
+    if not firefox_binary:
+        raise ValueError("exécutable Firefox introuvable")
+
+    process = subprocess.run(
+        [firefox_binary, "-CreateProfile", f"{name} {profile_path}"],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if process.returncode != 0:
+        details = (process.stderr or process.stdout).strip()
+        raise RuntimeError(details or f"Firefox a retourné le code {process.returncode}")
+
+    created = next(
+        (
+            profile
+            for profile in discover_profiles(root)
+            if profile.path.resolve(strict=False) == profile_path.resolve(strict=False)
+        ),
+        None,
+    )
+    if created is None or not profile_path.is_dir():
+        raise RuntimeError("Firefox n'a pas enregistré le nouveau profil")
+
+    if make_default:
+        set_default_profile(created, root)
+        created = FirefoxProfile(created.name, created.path, True)
+    return CreatedProfile(created, make_default)
 
 
 def firefox_processes() -> list[tuple[int, str]]:
@@ -496,6 +613,11 @@ class App:
         )
         self.profile_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         self.profile_box.bind("<<ComboboxSelected>>", lambda event: self.scan())
+        ttk.Button(
+            controls,
+            text="Créer un profil",
+            command=self.create_profile,
+        ).pack(side=tk.LEFT)
 
         if self.profile_by_label:
             self.profile_var.set(next(iter(self.profile_by_label)))
@@ -548,6 +670,56 @@ class App:
 
     def selected_profile(self) -> FirefoxProfile | None:
         return self.profile_by_label.get(self.profile_var.get())
+
+    def reload_profiles(self, selected_path: Path | None = None) -> None:
+        self.profiles = discover_profiles()
+        self.profile_by_label = {
+            self.profile_label(profile): profile for profile in self.profiles
+        }
+        self.profile_box.configure(values=list(self.profile_by_label))
+        selected_label = next(
+            (
+                label
+                for label, profile in self.profile_by_label.items()
+                if selected_path is not None
+                and profile.path.resolve(strict=False) == selected_path.resolve(strict=False)
+            ),
+            next(iter(self.profile_by_label), ""),
+        )
+        self.profile_var.set(selected_label)
+        self.scan()
+
+    def create_profile(self) -> None:
+        if firefox_processes():
+            messagebox.showerror(
+                "Firefox est ouvert",
+                "Ferme complètement Firefox avant de créer un profil.",
+            )
+            return
+        name = simpledialog.askstring(
+            "Nouveau profil",
+            "Nom du profil persistant :",
+            initialvalue="42-persistent",
+            parent=self.root,
+        )
+        if name is None:
+            return
+        make_default = messagebox.askyesno(
+            "Profil par défaut",
+            "Définir ce nouveau profil comme profil Firefox par défaut ?",
+        )
+        try:
+            result = create_firefox_profile(name, make_default=make_default)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            messagebox.showerror("Création impossible", str(error))
+            return
+        self.reload_profiles(result.profile.path)
+        default_text = " et défini par défaut" if result.made_default else ""
+        messagebox.showinfo(
+            "Profil créé",
+            f"Profil {result.profile.name!r} créé{default_text}.\n\n"
+            f"Répertoire racine : {result.profile.path}",
+        )
 
     def scan(self) -> None:
         for row in self.tree.get_children():
@@ -660,12 +832,36 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="nouveau profil propre recevant les données",
     )
+    parser.add_argument(
+        "--create-profile",
+        metavar="NAME",
+        help="crée un profil persistant sous ~/.mozilla/firefox",
+    )
+    parser.add_argument(
+        "--no-default",
+        action="store_true",
+        help="ne définit pas le profil créé comme profil par défaut",
+    )
     return parser
 
 
 def main(argv: list[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.no_default and not args.create_profile:
+        parser.error("--no-default nécessite --create-profile")
+    if args.create_profile and (
+        args.scan
+        or args.repair
+        or args.migrate_from
+        or args.migrate_to
+        or args.profile
+        or args.all_profiles
+        or args.cache_only
+        or args.include_extensions
+        or args.extensions_only
+    ):
+        parser.error("--create-profile doit être utilisé seul, avec --yes et éventuellement --no-default")
     if bool(args.migrate_from) != bool(args.migrate_to):
         parser.error("--migrate-from et --migrate-to doivent être utilisés ensemble")
     if args.cache_only and args.extensions_only:
@@ -676,6 +872,30 @@ def main(argv: list[str]) -> int:
     include_cache = not args.extensions_only
     include_extensions = args.extensions_only or args.include_extensions
     profiles = select_profiles(discover_profiles(), args.profile, args.all_profiles)
+
+    if args.create_profile:
+        try:
+            name = valid_profile_name(args.create_profile)
+        except ValueError as error:
+            parser.error(str(error))
+        print(
+            f"Création du profil {name!r} sous {FIREFOX_DIR}."
+            + ("" if args.no_default else "\nIl deviendra le profil par défaut.")
+        )
+        if not args.yes:
+            print("\nAjoute --yes pour confirmer la création.", file=sys.stderr)
+            return 2
+        if firefox_processes():
+            print("\nCréation refusée: Firefox est encore ouvert.", file=sys.stderr)
+            return 3
+        try:
+            result = create_firefox_profile(name, make_default=not args.no_default)
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            print(f"\nCréation impossible: {error}", file=sys.stderr)
+            return 1
+        print(f"\nProfil créé: {result.profile.path}")
+        print(f"Profil par défaut: {'oui' if result.made_default else 'non'}")
+        return 0
 
     if args.migrate_from and args.migrate_to:
         old_profile = Path(args.migrate_from)
